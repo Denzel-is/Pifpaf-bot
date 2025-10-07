@@ -491,7 +491,7 @@ async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rebuild_jobs(context)
         ivals = fetch_day_intervals(user_id, day)
         await query.edit_message_text(
-            f"✅ Интервал удалён.\n\n📅 <b>{WEEKDAYS_RУ[day]}</b>\nТекущие интервалы:\n{format_intervals_list(ivals)}",
+            f"✅ Интервал удалён.\n\n📅 <b>{WEEKDAYS_RU[day]}</b>\nТекущие интервалы:\n{format_intervals_list(ivals)}",
             parse_mode=ParseMode.HTML, reply_markup=kb_day_actions(day, bool(ivals))
         )
         return EDIT_DAY_SCREEN

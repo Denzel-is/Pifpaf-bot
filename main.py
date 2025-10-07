@@ -1,4 +1,4 @@
-# app.py
+# main.py
 import os
 import logging
 import io
@@ -7,39 +7,53 @@ from pathlib import Path
 from datetime import time, datetime, timedelta
 from typing import Optional, Tuple, List, Dict
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
-
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+)
 from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes,
-    ConversationHandler, MessageHandler, CallbackQueryHandler, filters
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
 )
-from fastapi import Request, HTTPException
 
 import psycopg
 from psycopg.rows import dict_row
 
+# =========================
+# ХАРДКОД НАСТРОЕК (ЗАМЕНИ ПРИ НУЖДЕ)
+# =========================
+TELEGRAM_BOT_TOKEN = "8289606829:AAGYJ1HeKinYItnhuIbD7-MrpMtYUZJmcy4"
+DATABASE_URL = "postgresql://neondb_owner:npg_0Dgy3HuIrEMw@ep-calm-band-ado557e5-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+ADMIN_TG_ID = 940253198  # целое число (без кавычек)
+
 # -----------------------
 # Logging
 # -----------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger("bot")
 
 # -----------------------
-# FastAPI app (webhook)
-# -----------------------
-app = FastAPI()
-
-# -----------------------
-# ENV & DB
+# Database
 # -----------------------
 def get_db_connection():
-    dsn = os.environ.get("DATABASE_URL", "") or os.environ.get("NEON_DSN", "")
+    dsn = DATABASE_URL
     if not dsn:
-        raise RuntimeError("Set DATABASE_URL (Neon Postgres DSN)")
+        raise RuntimeError("DATABASE_URL is empty")
     return psycopg.connect(dsn, row_factory=dict_row)
 
 def init_db() -> None:
@@ -50,17 +64,17 @@ def init_db() -> None:
                 id SERIAL PRIMARY KEY,
                 tg_id BIGINT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
-                username TEXT,
                 registered_at TIMESTAMPTZ NOT NULL
             );
             """
         )
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS schedule_intervals (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL,
-                weekday INTEGER NOT NULL,          -- 0=Пн ... 6=Вс
+                weekday INTEGER NOT NULL,          -- 0 = Пн ... 6 = Вс
                 start_time TEXT NOT NULL,          -- "HH:MM"
                 end_time TEXT NOT NULL             -- "HH:MM"
             );
@@ -75,20 +89,15 @@ def init_db() -> None:
             """
         )
         conn.commit()
-@app.get("/unset")
-async def unset():
-    try:
-        await get_bot_app().bot.delete_webhook(drop_pending_updates=True)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to delete webhook: {e}")
 
-def upsert_user_on_event_tg(tg_user) -> Optional[int]:
-    if not tg_user:
+def upsert_user_on_event(update: Update) -> Optional[int]:
+    if not update.effective_user:
         return None
-    tg_id = tg_user.id
-    name = tg_user.full_name or tg_user.username or "User"
-    username = tg_user.username
+    tg = update.effective_user
+    tg_id = tg.id
+    name = tg.full_name or tg.username or "User"
+    username = tg.username
+
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT id, name, username FROM users WHERE tg_id = %s", (tg_id,))
         row = cur.fetchone()
@@ -100,54 +109,69 @@ def upsert_user_on_event_tg(tg_user) -> Optional[int]:
             return int(row["id"])
         cur.execute(
             "INSERT INTO users (tg_id, name, username, registered_at) VALUES (%s, %s, %s, NOW()) RETURNING id",
-            (tg_id, name, username)
+            (tg_id, name, username),
         )
         new_id = int(cur.fetchone()["id"])
         conn.commit()
         return new_id
+
+def get_or_create_user_id(tg_id: int, name: Optional[str] = None, username: Optional[str] = None) -> Optional[int]:
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM users WHERE tg_id = %s", (tg_id,))
+        row = cur.fetchone()
+        if row:
+            return int(row["id"])
+        if name is None:
+            return None
+        cur.execute(
+            "INSERT INTO users (tg_id, name, username, registered_at) VALUES (%s, %s, %s, NOW()) RETURNING id",
+            (tg_id, name, username),
+        )
+        new_id = cur.fetchone()["id"]
+        conn.commit()
+        return int(new_id)
 
 def get_user_by_tg_id(tg_id: int):
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM users WHERE tg_id = %s", (tg_id,))
         return cur.fetchone()
 
-def get_group_chat_id() -> Optional[int]:
-    with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT chat_id FROM bot_group WHERE id = 1")
-        row = cur.fetchone()
-        return int(row["chat_id"]) if row else None
-
-def set_group_chat_id(chat_id: int) -> None:
+def get_users_with_classes_on_weekday(weekday: int) -> List[dict]:
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO bot_group (id, chat_id) VALUES (1, %s) "
-            "ON CONFLICT(id) DO UPDATE SET chat_id = EXCLUDED.chat_id",
-            (chat_id,),
+            """
+            SELECT DISTINCT u.id, u.tg_id, u.name, u.username
+            FROM users u
+            JOIN schedule_intervals si ON si.user_id = u.id
+            WHERE si.weekday = %s
+            ORDER BY u.name
+            """,
+            (weekday,),
         )
-        conn.commit()
+        return cur.fetchall() or []
 
 def set_day_intervals(user_id: int, weekday: int, intervals: List[Tuple[str, str]]) -> None:
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM schedule_intervals WHERE user_id = %s AND weekday = %s", (user_id, weekday))
-        for s, e in intervals:
+        for start, end in intervals:
             cur.execute(
                 "INSERT INTO schedule_intervals (user_id, weekday, start_time, end_time) VALUES (%s, %s, %s, %s)",
-                (user_id, weekday, s, e)
+                (user_id, weekday, start, end),
             )
         conn.commit()
 
 def fetch_day_intervals(user_id: int, weekday: int) -> List[Tuple[str, str]]:
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT start_time, end_time FROM schedule_intervals WHERE user_id=%s AND weekday=%s ORDER BY start_time",
-            (user_id, weekday)
+            "SELECT start_time, end_time FROM schedule_intervals WHERE user_id = %s AND weekday = %s ORDER BY start_time",
+            (user_id, weekday),
         )
         rows = cur.fetchall() or []
         return [(r["start_time"], r["end_time"]) for r in rows]
 
 def delete_interval_by_id(user_id: int, interval_id: int) -> None:
     with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM schedule_intervals WHERE id=%s AND user_id=%s", (interval_id, user_id))
+        cur.execute("DELETE FROM schedule_intervals WHERE id = %s AND user_id = %s", (interval_id, user_id))
         conn.commit()
 
 def fetch_all_intervals_joined() -> List[dict]:
@@ -165,43 +189,56 @@ def fetch_all_intervals_joined() -> List[dict]:
 def fetch_day_interval_rows_with_ids(user_id: int, weekday: int) -> List[dict]:
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id, start_time, end_time FROM schedule_intervals WHERE user_id=%s AND weekday=%s ORDER BY start_time",
-            (user_id, weekday)
+            "SELECT id, start_time, end_time FROM schedule_intervals WHERE user_id = %s AND weekday = %s ORDER BY start_time",
+            (user_id, weekday),
         )
         return cur.fetchall() or []
 
-def get_users_with_classes_on_weekday(weekday: int) -> List[dict]:
+def get_group_chat_id() -> Optional[int]:
+    with get_db_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT chat_id FROM bot_group WHERE id = 1")
+        row = cur.fetchone()
+        return int(row["chat_id"]) if row else None
+
+def set_group_chat_id(chat_id: int) -> None:
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT DISTINCT u.id, u.tg_id, u.name, u.username
-            FROM users u
-            JOIN schedule_intervals si ON si.user_id = u.id
-            WHERE si.weekday = %s
-            ORDER BY u.name
-            """,
-            (weekday,),
+            "INSERT INTO bot_group (id, chat_id) VALUES (1, %s) "
+            "ON CONFLICT(id) DO UPDATE SET chat_id = EXCLUDED.chat_id",
+            (chat_id,),
         )
-        return cur.fetchall() or []
+        conn.commit()
 
 # -----------------------
-# States & helpers
+# States
 # -----------------------
 ASK_NAME, ASK_DAY_HAS, ASK_DAY_TIME = range(3)
 EDIT_MENU, EDIT_SELECT_DAY, EDIT_DAY_SCREEN, EDIT_AWAIT_INPUT = range(20, 24)
 
-WEEKDAYS_RU = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
+WEEKDAYS_RU = [
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Воскресенье",
+]
 
 @dataclass
 class RegState:
     weekday_index: int = 0
     name: Optional[str] = None
 
+# -----------------------
+# Utilities
+# -----------------------
 def parse_time_range(text: str) -> Optional[Tuple[str, str]]:
     try:
         cleaned = text.replace(" ", "")
         parts = cleaned.split("-")
-        if len(parts) != 2: return None
+        if len(parts) != 2:
+            return None
         start_s, end_s = parts
         s_h, s_m = [int(x) for x in start_s.split(":")]
         e_h, e_m = [int(x) for x in end_s.split(":")]
@@ -215,12 +252,14 @@ def parse_time_range(text: str) -> Optional[Tuple[str, str]]:
 
 def parse_intervals(text: str) -> Optional[List[Tuple[str, str]]]:
     parts = [p.strip() for p in text.split(",") if p.strip()]
-    if not parts: return None
+    if not parts:
+        return None
     result: List[Tuple[str, str]] = []
     last_end: Optional[Tuple[int, int]] = None
     for p in parts:
         rng = parse_time_range(p)
-        if not rng: return None
+        if not rng:
+            return None
         s, e = rng
         s_h, s_m = [int(x) for x in s.split(":")]
         e_h, e_m = [int(x) for x in e.split(":")]
@@ -239,8 +278,7 @@ def merge_and_validate_intervals(existing: List[Tuple[str, str]], new_intervals:
     merged: List[Tuple[str, str]] = []
     for s, e in all_intervals:
         if not merged:
-            merged.append((s, e))
-            continue
+            merged.append((s, e)); continue
         _, last_e = merged[-1]
         if to_min(s) <= to_min(last_e):
             return None
@@ -265,15 +303,16 @@ def mention_html(name: str, tg_id: int, username: Optional[str]) -> str:
     return f'<a href="tg://user?id={tg_id}">{safe_name}</a>'
 
 # -----------------------
-# Handlers (регистрация)
+# Registration
 # -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
-    existing = get_user_by_tg_id(update.effective_user.id)
+    upsert_user_on_event(update)
+    user = update.effective_user
+    existing = get_user_by_tg_id(user.id)
     if existing:
         await update.effective_message.reply_text(
             f"Вы уже зарегистрированы как {existing['name']}.\n"
-            "Используйте /edit для редактирования расписания или /status для просмотра."
+            "Используйте /edit для редактирования расписания или /status, чтобы посмотреть его."
         )
         return ConversationHandler.END
     await update.effective_message.reply_text("Привет! Введите ваше имя для регистрации:")
@@ -285,17 +324,11 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.effective_message.reply_text("Имя не должно быть пустым. Введите имя:")
         return ASK_NAME
-    tg_user = update.effective_user
-    user_id = upsert_user_on_event_tg(tg_user)
-    # обновим имя, если нужно
-    with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE users SET name=%s WHERE tg_id=%s", (name, tg_user.id))
-        conn.commit()
-    context.user_data["user_id"] = user_id
     context.user_data["reg_state"].name = name
-    await update.effective_message.reply_text(
-        "Отлично! Теперь для каждого дня недели скажите, есть ли пары (да/нет)."
-    )
+    tg_user = update.effective_user
+    user_id = get_or_create_user_id(tg_user.id, name, tg_user.username)
+    context.user_data["user_id"] = user_id
+    await update.effective_message.reply_text("Отлично! Теперь для каждого дня скажите, есть ли пары (да/нет).")
     await update.effective_message.reply_text(f"{WEEKDAYS_RU[0]}: пары есть? (да/нет)")
     return ASK_DAY_HAS
 
@@ -316,8 +349,7 @@ async def ask_day_has(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"{WEEKDAYS_RU[st.weekday_index]}: пары есть? (да/нет)")
         return ASK_DAY_HAS
     await update.effective_message.reply_text(
-        "Введите интервал(ы): HH:MM-HH:MM, можно несколько через запятую.\n"
-        "Например: 08:00-08:50, 09:00-09:50"
+        "Введите интервал(ы): HH:MM-HH:MM, можно несколько через запятую.\nНапример: 08:00-08:50, 09:00-09:50"
     )
     return ASK_DAY_TIME
 
@@ -343,12 +375,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # -----------------------
-# UI helpers
+# Pretty UI helpers
 # -----------------------
 def kb_main_edit_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Выбрать день", callback_data="edit_select_day")],
-        [InlineKeyboardButton("📤 Экспорт моего расписания", callback_data="edit_export_me")],
+        [InlineKeyboardButton("📤 Экспорт моего расписания (текст)", callback_data="edit_export_me")],
         [InlineKeyboardButton("❌ Выйти", callback_data="edit_cancel")]
     ])
 
@@ -374,21 +406,20 @@ def format_intervals_list(intervals: List[Tuple[str, str]]) -> str:
 # Edit flow
 # -----------------------
 async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     user_row = get_user_by_tg_id(update.effective_user.id)
     if not user_row:
         await update.effective_message.reply_text("Вы не зарегистрированы. Используйте /start.")
         return ConversationHandler.END
     await update.effective_message.reply_html("🔧 <b>Редактирование расписания</b>\n\nВыберите действие:", reply_markup=kb_main_edit_menu())
-    context.user_data.pop("await_input", None)
-    context.user_data.pop("edit_selected_day", None)
+    context.user_data.pop("await_input", None); context.user_data.pop("edit_selected_day", None)
     return EDIT_MENU
 
 async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query: return
     await query.answer()
-    upsert_user_on_event_tg(query.from_user)
+    upsert_user_on_event(update)
     data = query.data or ""
     user_row = get_user_by_tg_id(query.from_user.id)
     if not user_row:
@@ -403,7 +434,7 @@ async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "edit_back_main":
         await query.edit_message_text("🔧 <b>Редактирование расписания</b>\n\nВыберите действие:",
-                                      parse_mode=ParseMode.HTML, reply_markup=kb_main_edit_menu())
+                                      reply_markup=kb_main_edit_menu(), parse_mode=ParseMode.HTML)
         context.user_data.pop("await_input", None); context.user_data.pop("edit_selected_day", None)
         return EDIT_MENU
 
@@ -417,7 +448,7 @@ async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return EDIT_MENU
 
     if data == "edit_select_day":
-        await query.edit_message_text("📅 <b>Выберите день недели:</b>", parse_mode=ParseMode.HTML, reply_markup=kb_days())
+        await query.edit_message_text("📅 <b>Выберите день недели:</b>", reply_markup=kb_days(), parse_mode=ParseMode.HTML)
         return EDIT_SELECT_DAY
 
     if data.startswith("edit_day_"):
@@ -460,7 +491,7 @@ async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rebuild_jobs(context)
         ivals = fetch_day_intervals(user_id, day)
         await query.edit_message_text(
-            f"✅ Интервал удалён.\n\n📅 <b>{WEEKDAYS_RU[day]}</b>\nТекущие интервалы:\n{format_intervals_list(ivals)}",
+            f"✅ Интервал удалён.\n\n📅 <b>{WEEKDAYS_RУ[day]}</b>\nТекущие интервалы:\n{format_intervals_list(ivals)}",
             parse_mode=ParseMode.HTML, reply_markup=kb_day_actions(day, bool(ivals))
         )
         return EDIT_DAY_SCREEN
@@ -470,8 +501,7 @@ async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["edit_selected_day"] = day
         context.user_data["await_input"] = "add_interval"
         await query.edit_message_text(
-            "➕ <b>Добавить интервал</b>\n\n"
-            "Введите <code>HH:MM-HH:MM</code> или несколько через запятую.\n"
+            "➕ <b>Добавить интервал</b>\n\nВведите <code>HH:MM-HH:MM</code> или несколько через запятую.\n"
             "Например: <code>08:00-08:50, 09:00-09:50</code>",
             parse_mode=ParseMode.HTML
         )
@@ -481,7 +511,7 @@ async def edit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("await_input"): return
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     user_row = get_user_by_tg_id(update.effective_user.id)
     if not user_row:
         await update.effective_message.reply_text("Вы не зарегистрированы. /start")
@@ -516,36 +546,37 @@ async def edit_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDIT_DAY_SCREEN
 
 # -----------------------
-# Прочие команды
+# Group binding and misc
 # -----------------------
 async def bind_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.effective_message.reply_text("Эту команду надо выполнять в группе, куда добавлен бот.")
+        await update.effective_message.reply_text("Команда должна выполняться в группе, куда добавлен бот.")
         return
     set_group_chat_id(chat.id)
-    await update.effective_message.reply_text("✅ Группа привязана для уведомлений.")
+    await update.effective_message.reply_text("✅ Группа успешно привязана для уведомлений.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     msg = (
         "/start — регистрация\n"
         "/status — моё расписание\n"
         "/edit — редактировать расписание\n"
-        "/schedule — общее расписание (таблица)\n"
-        "/bindgroup — привязать текущую группу (выполнять в группе)\n"
+        "/schedule — общее расписание (таблицы)\n"
+        "/bindgroup — привязать эту группу\n"
         "/myid — мой Telegram ID\n"
-        "/resetdb — сброс схемы БД (админ)\n"
+        "/admin — админ-панель (ЛС)\n"
+        "/resetdb — сброс БД (админ)\n"
     )
     await update.effective_message.reply_text(msg)
 
 async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     await update.effective_message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     user_row = get_user_by_tg_id(update.effective_user.id)
     if not user_row:
         await update.effective_message.reply_text("Вы не зарегистрированы. /start")
@@ -558,14 +589,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grouped.setdefault(int(r["weekday"]), []).append((r["start_time"], r["end_time"]))
     lines = [f"Имя: {user_row['name']}"]
     for i in range(7):
-        if i in grouped:
-            lines.append(f"{WEEKDAYS_RU[i]}: " + ", ".join([f"{s}-{e}" for s, e in grouped[i]]))
-        else:
-            lines.append(f"{WEEKDAYS_RU[i]}: нет пар")
+        lines.append(f"{WEEKDAYS_RU[i]}: " + (", ".join([f"{s}-{e}" for s, e in grouped[i]]) if i in grouped else "нет пар"))
     await update.effective_message.reply_text("\n".join(lines))
 
 # -----------------------
-# /schedule (красиво)
+# /schedule (таблично)
 # -----------------------
 def build_day_table_block(day_num: int, entries: List[Tuple[str, str]]) -> str:
     if not entries:
@@ -578,7 +606,7 @@ def build_day_table_block(day_num: int, entries: List[Tuple[str, str]]) -> str:
     return "\n".join(lines) + "\n"
 
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user_on_event_tg(update.effective_user)
+    upsert_user_on_event(update)
     rows = fetch_all_intervals_joined()
     by_day: Dict[int, Dict[str, List[str]]] = {i: {} for i in range(7)}
     for r in rows:
@@ -599,17 +627,17 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(current, parse_mode=ParseMode.MARKDOWN)
 
 # -----------------------
-# Уведомления за 2 минуты до конца пары
+# Notifications (T-2 min)
 # -----------------------
 async def notify_before_end(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data or {}
-    user_name = data.get("user_name", "Кто-то")
-    user_id = data.get("user_id")
-    weekday = data.get("weekday")
-    end_time = data.get("end_time")
+    job_data = context.job.data or {}
+    user_name = job_data.get("user_name", "Кто-то")
+    weekday = job_data.get("weekday")
+    end_time = job_data.get("end_time")
     group_id = get_group_chat_id()
     if not group_id: return
     users_same_day = get_users_with_classes_on_weekday(weekday)
+    if not users_same_day: return
     mentions = ", ".join([mention_html(u["name"], u["tg_id"], u.get("username")) for u in users_same_day]) or "—"
     text = f"⏳ Пара у <b>{user_name}</b> заканчивается в <b>{end_time}</b> (через ~2 мин).\nКто идёт? {mentions}"
     try:
@@ -621,7 +649,7 @@ async def rebuild_jobs(context: ContextTypes.DEFAULT_TYPE):
     for job in list(context.job_queue.jobs()):
         job.schedule_removal()
     with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT si.weekday, si.end_time, u.id AS user_id, u.name FROM schedule_intervals si JOIN users u ON u.id=si.user_id")
+        cur.execute("SELECT si.weekday, si.end_time, u.id AS user_id, u.name FROM schedule_intervals si JOIN users u ON u.id = si.user_id")
         rows = cur.fetchall()
     for r in rows or []:
         weekday = int(r["weekday"])
@@ -637,33 +665,89 @@ async def rebuild_jobs(context: ContextTypes.DEFAULT_TYPE):
         )
 
 # -----------------------
-# Админ
+# Admin
 # -----------------------
-async def reset_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = os.environ.get("ADMIN_TG_ID")
-    if not admin_id or str(update.effective_user.id) != str(admin_id):
-        await update.effective_message.reply_text("Недостаточно прав.")
+def require_admin(user_id: int) -> bool:
+    return ADMIN_TG_ID and int(user_id) == int(ADMIN_TG_ID)
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user_on_event(update)
+    if update.effective_chat and update.effective_chat.type not in (ChatType.PRIVATE,):
+        await update.effective_message.reply_text("Открыть /admin можно только в личном чате с ботом."); return
+    if not require_admin(update.effective_user.id):
+        await update.effective_message.reply_text("Только администратор может использовать этот раздел."); return
+    args = context.args or []
+    if not args:
+        await update.effective_message.reply_text(
+            "Команды админа:\n"
+            "/admin list — список пользователей\n"
+            "/admin delete <tg_id> — удалить пользователя\n"
+            "/admin export — экспорт пользователей и расписаний в CSV"
+        ); return
+    sub = args[0].lower()
+    if sub == "list":
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, tg_id, username, name FROM users ORDER BY id")
+            rows = cur.fetchall()
+        if not rows: await update.effective_message.reply_text("Пользователей нет."); return
+        lines = ["Пользователи:"] + [f"id={r['id']} tg_id={r['tg_id']} username={r['username']} name={r['name']}" for r in rows]
+        await update.effective_message.reply_text("\n".join(lines)); return
+    if sub == "export":
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT u.tg_id, u.username, u.name, si.weekday, si.start_time, si.end_time
+                FROM users u
+                LEFT JOIN schedule_intervals si ON si.user_id = u.id
+                ORDER BY u.id, si.weekday, si.start_time
+                """
+            ); rows = cur.fetchall()
+        out = io.StringIO(); out.write("tg_id,username,name,weekday,start_time,end_time\n")
+        for r in rows or []:
+            tg_id = r.get("tg_id"); username = r.get("username") or ""; name = (r.get("name") or "").replace(",", " ")
+            weekday = r.get("weekday"); start_t = r.get("start_time") or ""; end_t = r.get("end_time") or ""
+            weekday_s = "" if weekday is None else str(int(weekday))
+            out.write(f"{tg_id},{username},{name},{weekday_s},{start_t},{end_t}\n")
+        data = out.getvalue().encode("utf-8"); out.close()
+        doc = InputFile(io.BytesIO(data), filename="schedules_export.csv")
+        try:
+            await update.effective_message.reply_document(document=doc, caption="Экспорт расписаний")
+        except Exception as e:
+            logger.exception("Failed to send export: %s", e)
+            await update.effective_message.reply_text("Не удалось отправить файл экспорта.")
         return
+    if sub == "delete" and len(args) >= 2:
+        tg_id_s = args[1]
+        try:
+            tg_id_i = int(tg_id_s)
+        except ValueError:
+            await update.effective_message.reply_text("tg_id должен быть числом."); return
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE tg_id = %s RETURNING id", (tg_id_i,)); row = cur.fetchone(); conn.commit()
+        if row: await update.effective_message.reply_text("Пользователь удален."); await rebuild_jobs(context)
+        else:   await update.effective_message.reply_text("Пользователь не найден.")
+        return
+    await update.effective_message.reply_text("Неизвестная подкоманда. Введите /admin для помощи.")
+
+async def reset_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not require_admin(update.effective_user.id):
+        await update.effective_message.reply_text("Недостаточно прав."); return
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS schedule_intervals CASCADE;")
         cur.execute("DROP TABLE IF EXISTS bot_group CASCADE;")
         cur.execute("DROP TABLE IF EXISTS users CASCADE;")
         conn.commit()
     init_db()
-    await update.effective_message.reply_text("База сброшена.")
+    await update.effective_message.reply_text("База данных очищена и инициализирована заново.")
 
 # -----------------------
-# Build PTB Application
+# Application
 # -----------------------
-_bot_app: Optional[Application] = None
-
 def build_application() -> Application:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
     init_db()
-
-    async def _post_init(a: Application):
+    async def _post_init(app_: Application):
         private_cmds = [
             BotCommand("start", "Регистрация и расписание"),
             BotCommand("help", "Подсказка по командам"),
@@ -671,6 +755,7 @@ def build_application() -> Application:
             BotCommand("status", "Моё расписание"),
             BotCommand("edit", "Редактировать моё расписание"),
             BotCommand("schedule", "Общее расписание группы"),
+            BotCommand("admin", "Админ-панель (только ЛС)"),
             BotCommand("resetdb", "Сброс базы (админ)"),
         ]
         group_cmds = [
@@ -681,17 +766,16 @@ def build_application() -> Application:
             BotCommand("schedule", "Общее расписание группы"),
         ]
         try:
-            await a.bot.set_my_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
-            await a.bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
+            await app_.bot.set_my_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
+            await app_.bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
         except Exception:
             pass
-
-        async def _rebuild_once(ctx: ContextTypes.DEFAULT_TYPE):
-            await rebuild_jobs(ctx)
-        if a.job_queue:
-            a.job_queue.run_once(_rebuild_once, when=0)
-
-    a: Application = ApplicationBuilder().token(token).post_init(_post_init).build()
+        async def _rebuild_once(context: ContextTypes.DEFAULT_TYPE):
+            await rebuild_jobs(context)
+        if app_.job_queue is not None:
+            app_.job_queue.run_once(_rebuild_once, when=0)
+        logger.info("Бот запущен (polling)")
+    app: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
     # Регистрация
     conv_reg = ConversationHandler(
@@ -706,7 +790,7 @@ def build_application() -> Application:
         persistent=False,
     )
 
-    # Редактор
+    # Редактор расписания
     conv_edit = ConversationHandler(
         entry_points=[CommandHandler("edit", edit_cmd)],
         states={
@@ -723,78 +807,29 @@ def build_application() -> Application:
         persistent=False,
     )
 
-    a.add_handler(conv_reg)
-    a.add_handler(conv_edit)
-    a.add_handler(CommandHandler("bindgroup", bind_group))
-    a.add_handler(CommandHandler("help", help_cmd))
-    a.add_handler(CommandHandler("myid", myid_cmd))
-    a.add_handler(CommandHandler("status", status_cmd))
-    a.add_handler(CommandHandler("schedule", schedule_cmd))
-    a.add_handler(CommandHandler("resetdb", reset_db))
-    return a
+    app.add_handler(conv_reg)
+    app.add_handler(conv_edit)
 
-def get_bot_app() -> Application:
-    global _bot_app
-    if _bot_app is None:
-        # локально можно использовать .env, на Render переменные берутся из панели
-        load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
-        _bot_app = build_application()
-    return _bot_app
+    # Общие команды
+    app.add_handler(CommandHandler("bindgroup", bind_group))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("myid", myid_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("schedule", schedule_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("resetdb", reset_db))
 
-# -----------------------
-# Webhook endpoints for Render
-# -----------------------
-@app.on_event("startup")
-async def on_startup():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+    # Заглушка под старые vote_* колбэки
+    app.add_handler(CallbackQueryHandler(lambda u, c: None, pattern="^vote_"))
 
-    # 1) пытаемся взять адрес от Render
-    base_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
-    if base_url:
-        url = f"{base_url.rstrip('/')}/webhook/{token}"
-        try:
-            await get_bot_app().bot.set_webhook(url=url, drop_pending_updates=True)
-            logger.info(f"Webhook set to {url}")
-        except Exception as e:
-            logger.exception("Failed to set webhook: %s", e)
-    else:
-        # ок, URL неизвестен — можно будет нажать /setup
-        logger.warning("No RENDER_EXTERNAL_URL/PUBLIC_URL. Use /setup route to set webhook after deploy.")
+    return app
 
-@app.get("/setup")
-async def setup(request: Request):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise HTTPException(500, "TELEGRAM_BOT_TOKEN not set")
-
-    # Собираем публичный адрес из заголовков Render
-    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-    if not host:
-        raise HTTPException(400, "Cannot determine host")
-
-    base_url = f"{scheme}://{host}"
-    url = f"{base_url.rstrip('/')}/webhook/{token}"
-
+def main():
+    app = build_application()
     try:
-        await get_bot_app().bot.set_webhook(url=url, drop_pending_updates=True)
-        return {"ok": True, "webhook": url}
-    except Exception as e:
-        logger.exception("set_webhook failed: %s", e)
-        raise HTTPException(500, f"Failed to set webhook: {e}")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        logger.warning("Бот остановлен")
 
-@app.get("/")
-async def health():
-    return {"ok": True}
-
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    real_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if token != real_token:
-        return JSONResponse({"ok": False, "error": "bad token"}, status_code=403)
-    data = await request.json()
-    update = Update.de_json(data, get_bot_app().bot)
-    await get_bot_app().process_update(update)
-    return {"ok": True}
+if __name__ == "__main__":
+    main()

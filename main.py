@@ -17,6 +17,7 @@ from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
     ConversationHandler, MessageHandler, CallbackQueryHandler, filters
 )
+from fastapi import Request, HTTPException
 
 import psycopg
 from psycopg.rows import dict_row
@@ -74,6 +75,13 @@ def init_db() -> None:
             """
         )
         conn.commit()
+@app.get("/unset")
+async def unset():
+    try:
+        await get_bot_app().bot.delete_webhook(drop_pending_updates=True)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete webhook: {e}")
 
 def upsert_user_on_event_tg(tg_user) -> Optional[int]:
     if not tg_user:
@@ -305,7 +313,7 @@ async def ask_day_has(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Регистрация завершена! Спасибо.")
             await rebuild_jobs(context)
             return ConversationHandler.END
-        await update.effective_message.reply_text(f"{WEEKДAYS_RU[st.weekday_index]}: пары есть? (да/нет)")
+        await update.effective_message.reply_text(f"{WEEKDAYS_RU[st.weekday_index]}: пары есть? (да/нет)")
         return ASK_DAY_HAS
     await update.effective_message.reply_text(
         "Введите интервал(ы): HH:MM-HH:MM, можно несколько через запятую.\n"
@@ -738,23 +746,44 @@ def get_bot_app() -> Application:
 # -----------------------
 @app.on_event("startup")
 async def on_startup():
-    # Авто-установка вебхука при старте
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-    base_url = (
-        os.getenv("PUBLIC_URL")               # задай в Render вручную (https://yourservice.onrender.com)
-        or os.getenv("RENDER_EXTERNAL_URL")   # Render сам выставляет
-    )
-    if not base_url:
-        logger.warning("No PUBLIC_URL/RENDER_EXTERNAL_URL set — webhook won't be set automatically.")
-        return
+
+    # 1) пытаемся взять адрес от Render
+    base_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
+    if base_url:
+        url = f"{base_url.rstrip('/')}/webhook/{token}"
+        try:
+            await get_bot_app().bot.set_webhook(url=url, drop_pending_updates=True)
+            logger.info(f"Webhook set to {url}")
+        except Exception as e:
+            logger.exception("Failed to set webhook: %s", e)
+    else:
+        # ок, URL неизвестен — можно будет нажать /setup
+        logger.warning("No RENDER_EXTERNAL_URL/PUBLIC_URL. Use /setup route to set webhook after deploy.")
+
+@app.get("/setup")
+async def setup(request: Request):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise HTTPException(500, "TELEGRAM_BOT_TOKEN not set")
+
+    # Собираем публичный адрес из заголовков Render
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if not host:
+        raise HTTPException(400, "Cannot determine host")
+
+    base_url = f"{scheme}://{host}"
     url = f"{base_url.rstrip('/')}/webhook/{token}"
+
     try:
         await get_bot_app().bot.set_webhook(url=url, drop_pending_updates=True)
-        logger.info(f"Webhook set to {url}")
+        return {"ok": True, "webhook": url}
     except Exception as e:
-        logger.exception("Failed to set webhook: %s", e)
+        logger.exception("set_webhook failed: %s", e)
+        raise HTTPException(500, f"Failed to set webhook: {e}")
 
 @app.get("/")
 async def health():
